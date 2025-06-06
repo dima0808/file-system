@@ -6,6 +6,7 @@ public class FileDescriptor {
   public int linkCount;
   public List<byte[]> blocks;
   public Map<String, Integer> entries; // For directories only
+  public String symlinkTarget; // For symlinks only
 
   public FileDescriptor(FileType type) {
     this.type = type;
@@ -15,6 +16,9 @@ public class FileDescriptor {
 
     if (type == FileType.DIRECTORY) {
       this.entries = new HashMap<>();
+    }
+    if (type == FileType.SYMLINK) {
+      this.symlinkTarget = null;
     }
   }
 }

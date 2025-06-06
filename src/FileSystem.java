@@ -4,6 +4,7 @@ public class FileSystem {
   private final FileDescriptor[] descriptors;
   private final FileDescriptor rootDirectory;
   private final Map<Integer, OpenFile> openFiles;
+  private int currentDirId = 0;
 
   private static class OpenFile {
     int descriptorId;
@@ -15,17 +16,57 @@ public class FileSystem {
     }
   }
 
+  private static class PathResult {
+    FileDescriptor dir;
+    String name;
+    int dirId;
+  }
+
+  private PathResult resolvePath(String pathname, boolean resolveLastSymlink) {
+    String[] parts = pathname.split("/");
+    FileDescriptor current;
+    int currentId;
+    if (pathname.startsWith("/")) {
+      current = rootDirectory;
+      currentId = 0;
+    } else {
+      current = descriptors[currentDirId];
+      currentId = currentDirId;
+    }
+    for (int i = 0; i < parts.length - 1; i++) {
+      if (parts[i].isEmpty()) continue;
+      if (!current.entries.containsKey(parts[i]))
+        throw new IllegalArgumentException("Шлях не знайдено: " + parts[i]);
+      int id = current.entries.get(parts[i]);
+      FileDescriptor next = descriptors[id];
+      if (next.type == FileType.SYMLINK) {
+        if (!resolveLastSymlink || i < parts.length - 2) {
+          String target = next.symlinkTarget;
+          return resolvePath(target + "/" + String.join("/", Arrays.copyOfRange(parts, i + 1, parts.length)), resolveLastSymlink);
+        }
+      }
+      if (next.type != FileType.DIRECTORY)
+        throw new IllegalArgumentException("Не є директорією: " + parts[i]);
+      current = next;
+      currentId = id;
+    }
+    PathResult result = new PathResult();
+    result.dir = current;
+    result.dirId = currentId;
+    result.name = parts[parts.length - 1];
+    return result;
+  }
+
   public FileSystem(int maxDescriptors) {
     descriptors = new FileDescriptor[maxDescriptors];
     rootDirectory = new FileDescriptor(FileType.DIRECTORY);
+    descriptors[0] = rootDirectory;
     openFiles = new HashMap<>();
   }
 
-  public void create(String name) {
-    if (name.length() > FileSystemState.MAX_FILENAME_LENGTH)
-      throw new IllegalArgumentException("Назва файлу задовга");
-
-    if (rootDirectory.entries.containsKey(name))
+  public void create(String pathname) {
+    PathResult pr = resolvePath(pathname, false);
+    if (pr.dir.entries.containsKey(pr.name))
       throw new IllegalArgumentException("Файл уже існує");
 
     int id = getFreeDescriptor();
@@ -33,18 +74,18 @@ public class FileSystem {
       throw new IllegalStateException("Немає вільних дескрипторів");
 
     descriptors[id] = new FileDescriptor(FileType.REGULAR);
-    rootDirectory.entries.put(name, id);
-    System.out.println("Файл '" + name + "' створено з дескриптором ID " + id);
+    pr.dir.entries.put(pr.name, id);
+    System.out.println("Файл '" + pathname + "' створено з дескриптором ID " + id);
   }
 
-  public int open(String name) {
-    if (!rootDirectory.entries.containsKey(name))
+  public int open(String pathname) {
+    PathResult pr = resolvePath(pathname, true);
+    if (!pr.dir.entries.containsKey(pr.name))
       throw new IllegalArgumentException("Файл не знайдено");
-
-    int id = rootDirectory.entries.get(name);
+    int id = pr.dir.entries.get(pr.name);
     int fd = getFreeFD();
     openFiles.put(fd, new OpenFile(id));
-    System.out.println("Файл '" + name + "' відкрито з дескриптором ID " + id + " та файловим дескриптором " + fd);
+    System.out.println("Файл '" + pathname + "' відкрито з дескриптором ID " + id + " та файловим дескриптором " + fd);
     return fd;
   }
 
@@ -119,11 +160,11 @@ public class FileSystem {
     openFiles.get(fd).position = offset;
   }
 
-  public void truncate(String name, int size) {
-    if (!rootDirectory.entries.containsKey(name))
-      throw new IllegalArgumentException("Файл не знайдено");
-
-    int id = rootDirectory.entries.get(name);
+  public void truncate(String pathname, int size) {
+    PathResult pr = resolvePath(pathname, true);
+    if (!pr.dir.entries.containsKey(pr.name))
+      throw new IllegalArgumentException("Файл '" + pathname + "' не знайдено");
+    int id = pr.dir.entries.get(pr.name);
     FileDescriptor desc = descriptors[id];
 
     if (size < desc.size) {
@@ -133,62 +174,131 @@ public class FileSystem {
     }
 
     desc.size = size;
-    System.out.println("Файл '" + name + "' скорочено до " + size + " байтів");
+    System.out.println("Файл '" + pathname + "' скорочено до " + size + " байтів");
   }
 
-  public void link(String existingName, String newName) {
-    if (!rootDirectory.entries.containsKey(existingName))
-      throw new IllegalArgumentException("Файл '" + existingName + "' не знайдено");
+  public void link(String existingPath, String newPath) {
+    PathResult existingPr = resolvePath(existingPath, true);
+    FileDescriptor existingDesc = descriptors[existingPr.dir.entries.get(existingPr.name)];
 
-    if (rootDirectory.entries.containsKey(newName))
-      throw new IllegalArgumentException("Файл '" + newName + "' вже існує");
-
-    int id = rootDirectory.entries.get(existingName);
-    rootDirectory.entries.put(newName, id);
-    descriptors[id].linkCount++;
-
-    System.out.println("Жорстке посилання '" + newName + "' створено на '" + existingName + "'");
-  }
-
-  public void unlink(String name) {
-    if (!rootDirectory.entries.containsKey(name))
-      throw new IllegalArgumentException("Файл '" + name + "' не знайдено");
-
-    int id = rootDirectory.entries.get(name);
-    rootDirectory.entries.remove(name);
-    descriptors[id].linkCount--;
-
-    if (descriptors[id].linkCount == 0 && isDescriptorClosed(id)) {
-      descriptors[id] = null;
-      System.out.println("Файл '" + name + "' повністю видалено (останнє посилання)");
-    } else {
-      System.out.println("Посилання на файл '" + name + "' видалено");
+    if (existingDesc.type == FileType.DIRECTORY) {
+      throw new IllegalArgumentException("Неможливо створити хард-посилання на директорію");
     }
+
+    PathResult newPr = resolvePath(newPath, false);
+    if (newPr.dir.entries.containsKey(newPr.name)) {
+      throw new IllegalArgumentException("Файл вже існує на новому шляху");
+    }
+
+    int id = existingPr.dir.entries.get(existingPr.name);
+    newPr.dir.entries.put(newPr.name, id);
+    existingDesc.linkCount++;
+
+    System.out.println("Хард-посилання створено: '" + newPath + "' -> '" + existingPath + "'");
   }
 
-  public void stat(String name) {
-    if (!rootDirectory.entries.containsKey(name))
-      throw new IllegalArgumentException("Файл '" + name + "' не знайдено");
-
-    int id = rootDirectory.entries.get(name);
+  public void unlink(String path) {
+    PathResult pr = resolvePath(path, false);
+    int id = pr.dir.entries.get(pr.name);
     FileDescriptor desc = descriptors[id];
 
-    System.out.println("Інформація про файл '" + name + "':");
-    System.out.println("  ID дескриптора: " + id);
-    System.out.println("  Тип: " + (desc.type == FileType.REGULAR ? "REGULAR" : "DIRECTORY"));
-    System.out.println("  Розмір: " + desc.size + " байтів");
-    System.out.println("  Кількість посилань: " + desc.linkCount);
-    System.out.println("  Кількість блоків: " + desc.blocks.size());
+    if (desc.type == FileType.DIRECTORY) {
+      throw new IllegalArgumentException("Неможливо видалити хард-посилання на директорію");
+    }
+
+    pr.dir.entries.remove(pr.name);
+    desc.linkCount--;
+
+    if (desc.linkCount == 0 && isDescriptorClosed(id)) {
+      descriptors[id] = null;
+      System.out.println("Файл '" + path + "' повністю видалено (всі посилання знищено)");
+    } else {
+      System.out.println("Посилання на файл '" + path + "' видалено");
+    }
   }
 
-  public void ls() {
-    System.out.println("Файли у кореневому каталозі:");
-    for (Map.Entry<String, Integer> entry : rootDirectory.entries.entrySet()) {
+  public void stat(String pathname) {
+    PathResult pr = resolvePath(pathname, true);
+    if (!pr.dir.entries.containsKey(pr.name))
+      throw new IllegalArgumentException("Файл '" + pathname + "' не знайдено");
+    int id = pr.dir.entries.get(pr.name);
+    FileDescriptor desc = descriptors[id];
+    System.out.println("Info for '" + pathname + "':");
+    System.out.println("  Descriptor ID: " + id);
+    System.out.println("  Type: " + desc.type);
+    System.out.println("  Size: " + desc.size + " bytes");
+    System.out.println("  Link count: " + desc.linkCount);
+    System.out.println("  Block count: " + desc.blocks.size());
+  }
+
+  public void ls(String pathname) {
+    PathResult pr = resolvePath(pathname, true);
+    int id = pr.dir.entries.get(pr.name);
+    FileDescriptor dir = descriptors[id];
+    if (dir.type != FileType.DIRECTORY)
+      throw new IllegalArgumentException("Не є директорією");
+    System.out.println("Файли в '" + pathname + "':");
+    for (Map.Entry<String, Integer> entry : dir.entries.entrySet()) {
       String name = entry.getKey();
-      int id = entry.getValue();
-      FileDescriptor desc = descriptors[id];
-      System.out.printf("  %-15s | ID: %-3d | Size: %-4d | Links: %d%n", name, id, desc.size, desc.linkCount);
+      int eid = entry.getValue();
+      FileDescriptor desc = descriptors[eid];
+      System.out.printf("  %-15s | ID: %-3d | Size: %-4d | Links: %d | Type: %s%n", name, eid, desc.size, desc.linkCount, desc.type);
     }
+  }
+
+  public void mkdir(String pathname) {
+    PathResult pr = resolvePath(pathname, false);
+    if (pr.dir.entries.containsKey(pr.name))
+      throw new IllegalArgumentException("Директорія вже існує");
+    int id = getFreeDescriptor();
+    if (id == -1)
+      throw new IllegalStateException("Немає вільних дескрипторів");
+    FileDescriptor dir = new FileDescriptor(FileType.DIRECTORY);
+    dir.entries.put(".", id);
+    dir.entries.put("..", pr.dirId);
+    descriptors[id] = dir;
+    pr.dir.entries.put(pr.name, id);
+    System.out.println("Директорія '" + pathname + "' створена");
+  }
+
+  public void rmdir(String pathname) {
+    PathResult pr = resolvePath(pathname, false);
+    int id = pr.dir.entries.get(pr.name);
+    FileDescriptor dir = descriptors[id];
+    if (dir.type != FileType.DIRECTORY)
+      throw new IllegalArgumentException("Не є директорією");
+    if (dir.entries.size() > 2)
+      throw new IllegalArgumentException("Директорія не порожня");
+    pr.dir.entries.remove(pr.name);
+    descriptors[id] = null;
+    System.out.println("Директорія '" + pathname + "' видалена");
+  }
+
+  public void cd(String pathname) {
+    PathResult pr = resolvePath(pathname, true);
+    int id = pr.dir.entries.get(pr.name);
+    FileDescriptor dir = descriptors[id];
+    if (dir.type != FileType.DIRECTORY)
+      throw new IllegalArgumentException("Не є директорією");
+    currentDirId = id;
+    System.out.println("Змінено поточну директорію на '" + pathname + "'");
+  }
+
+  public void symlink(String target, String pathname) {
+    if (target.length() > FileSystemState.BLOCK_SIZE)
+      throw new IllegalArgumentException("Символьне посилання занадто довге");
+    PathResult pr = resolvePath(pathname, false);
+    if (pr.dir.entries.containsKey(pr.name))
+      throw new IllegalArgumentException("Файл вже існує");
+    int id = getFreeDescriptor();
+    if (id == -1)
+      throw new IllegalStateException("Немає вільних дескрипторів");
+    FileDescriptor link = new FileDescriptor(FileType.SYMLINK);
+    link.symlinkTarget = target;
+    link.size = target.length();
+    descriptors[id] = link;
+    pr.dir.entries.put(pr.name, id);
+    System.out.println("Символьне посилання '" + pathname + "' -> '" + target + "' створено");
   }
 
   private int getFreeDescriptor() {
